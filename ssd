@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# ==================================================================
+#  Move Hive OS from the USB stick to the laptop's internal SSD.
+#  WARNING: ERASES the internal SSD (Manjaro and every file on it).
+#  Keeps the same worker: copies rig.conf + network settings over.
+#  Run it from Hive OS booted on the USB:   bash /tmp/ssd.sh
+# ==================================================================
+IMAGE_URL='https://download.hiveos.farm/latest/'   # latest stable Hive OS
+
+G='\e[1;32m'; Y='\e[1;33m'; R='\e[1;31m'; C='\e[1;36m'; N='\e[0m'
+ok()   { echo -e "${G}[ OK ]${N} $*"; }
+warn() { echo -e "${Y}[WARN]${N} $*"; }
+die()  { echo -e "${R}[FAIL]${N} $*"; exit 1; }
+
+[[ $EUID -ne 0 ]] && exec sudo bash "$0" "$@"
+[[ -t 0 ]] || die "Run it from a file: bash /tmp/ssd.sh"
+
+# --- 1. Find the USB we booted from and the internal drive ---------
+ROOT_SRC=$(findmnt -no SOURCE /)
+BOOT=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null | head -n 1)
+[[ -n $BOOT ]] || die "Can't tell which drive Hive is running from."
+
+mapfile -t CANDS < <(lsblk -dn -b -o NAME,TYPE,TRAN,SIZE |
+  awk -v boot="$BOOT" '$2=="disk" && $1!=boot && $3!="usb" &&
+       $1 !~ /^(loop|zram|sr|mmcblk)/ && $NF>=8000000000 {print $1}')
+
+case ${#CANDS[@]} in
+  0) die "No internal drive found (Hive is running from /dev/$BOOT)." ;;
+  1) T=${CANDS[0]} ;;
+  *) echo "Internal drives:"
+     for d in "${CANDS[@]}"; do lsblk -dno NAME,SIZE,MODEL "/dev/$d"; done
+     read -r -p "Type the drive name to install Hive OS on: " T
+     [[ " ${CANDS[*]} " == *" $T "* ]] || die "Not in the list. Nothing was changed." ;;
+esac
+
+MODEL=$(lsblk -dno MODEL "/dev/$T" | xargs)
+SIZE=$(lsblk -dno SIZE "/dev/$T" | xargs)
+echo
+echo -e "${C}Hive OS is running from:${N} /dev/$BOOT (USB)"
+echo -e "${C}It will be installed on:${N} /dev/$T  $MODEL  $SIZE"
+lsblk -o NAME,SIZE,FSTYPE,LABEL "/dev/$T"
+echo
+
+# --- 2. Worker config to carry over --------------------------------
+RIG_ID=; RIG_PASSWD=
+if [[ -f /hive-config/rig.conf ]]; then
+  RIG_ID=$(grep -oP '^RIG_ID="?\K[0-9]+' /hive-config/rig.conf)
+  RIG_PASSWD=$(grep -oP '^RIG_PASSWD="?\K[^"]+' /hive-config/rig.conf)
+fi
+if [[ -n $RIG_ID ]]; then
+  ok "Worker config found (rig ID $RIG_ID). The SSD keeps the same worker."
+else
+  warn "No worker config on this USB. The SSD will ask for a Rig ID or farm hash."
+fi
+
+echo -e "${R}Everything on /dev/$T will be erased, including Manjaro and your files.${N}"
+read -r -p "Type ERASE to continue: " ans
+[[ $ans == ERASE ]] || die "Cancelled. Nothing was changed."
+
+# --- 3. Prepare -----------------------------------------------------
+command -v sgdisk >/dev/null ||
+  timeout 180 apt-get install -y -qq gdisk >/dev/null 2>&1 ||
+  warn "Couldn't install gdisk. Continuing."
+
+echo -e "${C}> Finding the latest stable Hive OS image...${N}"
+URL=$(curl -fsSL --head --retry 2 --connect-timeout 20 -o /dev/null \
+        -w '%{url_effective}' "$IMAGE_URL" 2>/dev/null) ||
+URL=$(curl -fsSL -r 0-0 --retry 2 --connect-timeout 20 -o /dev/null \
+        -w '%{url_effective}' "$IMAGE_URL" 2>/dev/null) || URL=
+[[ $URL =~ hiveos-.*\.(xz|gz|zip)$ ]] ||
+  die "Couldn't get the image link. Check the internet and run again. Nothing was changed."
+case $URL in
+  *.xz)  UNPACK='xz -dc' ;;
+  *.gz)  UNPACK='gzip -dc' ;;
+  *.zip) command -v funzip >/dev/null || die "funzip is missing. Nothing was changed."
+         UNPACK='funzip' ;;
+esac
+ok "Image: $(basename "$URL")"
+
+for p in $(lsblk -lnpo NAME "/dev/$T" | tail -n +2); do
+  swapoff "$p" 2>/dev/null; umount -f "$p" 2>/dev/null
+done
+command -v vgchange >/dev/null && vgchange -an >/dev/null 2>&1
+
+# --- 4. Download and write -----------------------------------------
+echo -e "${C}> Downloading and writing Hive OS to /dev/$T. This takes a few minutes...${N}"
+set -o pipefail
+if curl -fsSL --retry 3 --connect-timeout 20 "$URL" | $UNPACK |
+   dd of="/dev/$T" bs=4M iflag=fullblock conv=fsync status=progress; then
+  ok "Image written"
+else
+  die "Writing failed. Your USB is fine. Run this script again."
+fi
+sync
+sgdisk -e "/dev/$T" >/dev/null 2>&1
+sgdisk -C "/dev/$T" >/dev/null 2>&1
+partprobe "/dev/$T" >/dev/null 2>&1
+udevadm settle >/dev/null 2>&1; sleep 2
+
+# --- 5. Copy the worker config to the SSD --------------------------
+copied=0
+CONF=$(lsblk -lnpo NAME,TYPE "/dev/$T" | awk '$2=="part"{print $1; exit}')
+MNT=/mnt/newhive-config
+if [[ -n $CONF && $(blkid -o value -s TYPE "$CONF") == vfat ]] &&
+   mkdir -p "$MNT" && mount "$CONF" "$MNT"; then
+  [[ -f /hive-config/rig.conf ]] && cp /hive-config/rig.conf "$MNT/"
+  for d in network openvpn watchdog; do
+    [[ -d /hive-config/$d ]] && cp -r "/hive-config/$d" "$MNT/"
+  done
+  sync
+  [[ -n $RIG_ID ]] && grep -q "^RIG_ID=\"\?$RIG_ID" "$MNT/rig.conf" 2>/dev/null && copied=1
+  umount "$MNT"
+fi
+if [[ $copied -eq 1 ]]; then
+  ok "Worker config copied: same worker, same flight sheet"
+elif [[ -n $RIG_ID ]]; then
+  warn "Couldn't copy the worker config. On first boot, enter:"
+  echo "       Rig ID: $RIG_ID   Password: $RIG_PASSWD"
+fi
+
+# --- 6. Done ----------------------------------------------------------
+echo
+ok "Hive OS is installed on the SSD."
+echo "Next: the laptop powers off. Unplug the USB, then turn the laptop on."
+echo "If Hive doesn't start, press F11 at the MSI logo and choose the SSD."
+read -r -p "Press Enter to power off now... " _
+sreboot shutdown 2>/dev/null || poweroff
