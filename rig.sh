@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
+[[ -f $0 ]] && grep -q $'\r' "$0" && { sed -i 's/\r$//' "$0" && exec bash "$0" "$@"; } # fix Windows line endings
 # ==================================================================
 #  Hive OS setup for ANY PC: desktop or laptop, NVIDIA / AMD / Intel
-#  - adds this PC to your farm as its own worker
-#  - can install Hive on the internal drive (erases it) and set up Wi-Fi
-#  - updates Hive, checks the GPUs, applies laptop tweaks on laptops
-#  Safe to re-run. On the rig:
-#   curl -fsSL https://raw.githubusercontent.com/sebasavalos-eng/hive/refs/heads/main/rig.sh -o /tmp/rig.sh && bash /tmp/rig.sh
+#  Does the whole first-time setup: Wi-Fi if there's no cable, adds the
+#  PC to your farm (no "Server API URL / RIG ID" questions), can install
+#  Hive on the internal drive, updates Hive, checks the GPUs, laptop tweaks.
+#
+#  FIRST BOOT of a new PC: when the screen asks for "Server API URL" or
+#  "RIG ID", press Ctrl+C. Then type ONE of these and press Enter:
+#   curl -fsSL https://raw.githubusercontent.com/sebasavalos-eng/hive/main/rig.sh -o /tmp/rig.sh && bash /tmp/rig.sh
+#   bash /hive-config/rig.sh      (works without internet once the scripts are on the drive)
+#
 #  This repo is PUBLIC: never write your farm hash or passwords here.
-#  The script asks for them and keeps them only on the rig.
+#  The script asks for them and keeps them only on the rig. Safe to re-run.
 # ==================================================================
 
 # ----------------------------- SETTINGS ---------------------------
-REPO_RAW='https://raw.githubusercontent.com/sebasavalos-eng/hive/refs/heads/main'
+REPO_RAW='https://raw.githubusercontent.com/sebasavalos-eng/hive/main'
 HIVE_API='https://api.hiveos.farm'
 DO_SELFUPGRADE=1        # 1 = update Hive OS
 MIN_NVIDIA=550          # older NVIDIA drivers get updated (RTX 50 cards: 580)
@@ -25,6 +30,7 @@ export PATH="/hive/bin:/hive/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 export RIG_CONF="${RIG_CONF:-/hive-config/rig.conf}"
 OWNER_FILE=/hive-config/network/rig-owner.txt   # which PC this drive belongs to
 HASH_FILE=/hive-config/farm-hash.txt            # farm hash, kept on this drive only
+SELF=$(readlink -f "$0" 2>/dev/null); SELF_DIR=${SELF%/*}
 
 LOG=/home/user/rig-setup.log; [[ -d /home/user ]] || LOG=/tmp/rig-setup.log
 exec > >(tee -a "$LOG") 2>&1
@@ -35,18 +41,34 @@ ok()   { printf '%s[ OK ]%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '%s[WARN]%s %s\n' "$Y" "$N" "$*"; }
 err()  { printf '%s[FAIL]%s %s\n' "$R" "$N" "$*"; }
 yes_no() { local a; read -r -p "$1" a; [[ ${a,,} == y* ]]; }
-online() { ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1; }
+online() { ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 ||
+           curl -s --max-time 6 -o /dev/null https://api.hiveos.farm; }
 dmi() { [[ -r /sys/class/dmi/id/$1 ]] && tr -d '\0' < "/sys/class/dmi/id/$1" | xargs; }
 # shellcheck disable=SC1090
 conf_get() { ( unset RIG_ID RIG_PASSWD WORKER_NAME FARM_HASH; . "$RIG_CONF" 2>/dev/null; printf '%s' "${!1:-}" ); }
+# wifi.sh / ssd.sh: use the copy next to this script, else download it. Prints the path.
+helper() {
+  local f=$1 dst=/tmp/rig-$1
+  if [[ $SELF_DIR != /tmp && -f $SELF_DIR/$f ]]; then tr -d '\r' < "$SELF_DIR/$f" > "$dst"
+  else curl -fsSL --max-time 30 "$REPO_RAW/$f" -o "$dst" 2>/dev/null; fi
+  [[ -s $dst ]] && echo "$dst"
+}
+# Keep rig.sh + helpers on this drive, so next time: bash /hive-config/rig.sh
+save_tools() {
+  local f src
+  [[ -d /hive-config ]] || return 0
+  [[ -f $SELF && $SELF != /hive-config/rig.sh ]] && tr -d '\r' < "$SELF" > /hive-config/rig.sh
+  if [[ $SELF_DIR != /hive-config ]]; then
+    for f in wifi.sh ssd.sh; do src=$(helper "$f") && cp -f "$src" "/hive-config/$f"; done
+  fi
+  return 0
+}
 TTY=0; [[ -t 0 ]] && TTY=1
-NEED_REBOOT=0; CONNECTED=0
+NEED_REBOOT=0; CONNECTED=0; WIFI_DONE=0
 echo "${C}Hive OS setup - $(date)${N}"
 
-online || { err "No internet. Plug in an Ethernet cable (or run Hive's 'wifi' command) and run this again."; exit 1; }
-
 # ------------------------------------------------------------------
-step "1/7 This PC"
+step "1/8 This PC"
 VENDOR=$(dmi sys_vendor); PRODUCT=$(dmi product_name)
 IS_LAPTOP=0
 [[ $(dmi chassis_type) =~ ^(8|9|10|14|31|32)$ ]] && IS_LAPTOP=1
@@ -74,7 +96,24 @@ else
 fi
 
 # ------------------------------------------------------------------
-step "2/7 Hive farm"
+step "2/8 Network"
+if ! online && [[ -n $WIFI_CARD && $TTY == 1 ]]; then
+  warn "No internet yet. Let's connect this PC to Wi-Fi."
+  if F=$(helper wifi.sh); then
+    bash "$F" && WIFI_DONE=1
+  else
+    err "wifi.sh isn't on this drive and can't be downloaded without internet."
+  fi
+fi
+if online; then
+  ok "Online - IP $(hostname -I 2>/dev/null | awk '{print $1}')"
+else
+  err "No internet. Plug in an Ethernet cable and run this again."
+  exit 1
+fi
+
+# ------------------------------------------------------------------
+step "3/8 Hive farm"
 SFX=$(tr -d ':' <<<"$MAC"); SFX=${SFX: -4}
 BASE=$(tr '[:upper:]' '[:lower:]' <<<"$PRODUCT" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//' | cut -c1-16 | sed -E 's/-+$//')
 [[ -z $BASE || $PRODUCT =~ O\.E\.M|[Ss]ystem\ [Pp]roduct|[Dd]efault\ [Ss]tring|[Tt]o\ [Bb]e\ [Ff]illed ]] && BASE=pc
@@ -147,7 +186,7 @@ else
 fi
 
 # ------------------------------------------------------------------
-step "3/7 Install on the internal drive"
+step "4/8 Install on the internal drive"
 if [[ $ROOT_TRAN != usb ]]; then
   ok "Already installed on this PC"
 elif [[ -z $INTERNAL ]]; then
@@ -156,11 +195,12 @@ elif [[ $CONNECTED == 1 && $TTY == 1 ]]; then
   echo "Hive can run from the internal drive ($INTERNAL) instead of the USB stick."
   echo "${R}That ERASES everything on that drive.${N}"
   if yes_no "Install Hive on the internal drive now? (y/N): "; then
-    if curl -fsSL "$REPO_RAW/ssd.sh" -o /tmp/ssd.sh; then
-      echo "${C}When it powers off: unplug the USB, turn the PC on, then run rig.sh again to finish.${N}"
-      exec bash /tmp/ssd.sh
+    save_tools
+    if F=$(helper ssd.sh); then
+      echo "${C}When it powers off: unplug the USB, turn the PC on and run:  bash /hive-config/rig.sh${N}"
+      exec bash "$F"
     fi
-    err "Couldn't download ssd.sh from your repo. Continuing from the USB."
+    err "Couldn't get ssd.sh from this drive or your repo. Continuing from the USB."
   else
     ok "Skipped: Hive keeps running from the USB stick"
   fi
@@ -169,7 +209,7 @@ else
 fi
 
 # ------------------------------------------------------------------
-step "4/7 Hive OS update + disk"
+step "5/8 Hive OS update + disk"
 if [[ $DO_SELFUPGRADE == 1 ]]; then
   if selfupgrade; then
     ok "Hive OS $(dpkg-query -W -f='${Version}' hive 2>/dev/null)"
@@ -183,7 +223,7 @@ NEWEST_K=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | ta
 [[ -n $NEWEST_K && $NEWEST_K != "$(uname -r)" ]] && NEED_REBOOT=1
 
 # ------------------------------------------------------------------
-step "5/7 GPUs"
+step "6/8 GPUs"
 NV=$(grep -ci nvidia <<<"$GPUS")
 AMDN=$(grep -ciE 'amd|ati ' <<<"$GPUS")
 ARC=$(grep -i intel <<<"$GPUS" | grep -ciE 'arc|dg2')
@@ -217,7 +257,7 @@ fi
 ((ARC > 0)) && ok "Intel Arc GPU found (details: intel-info)"
 
 # ------------------------------------------------------------------
-step "6/7 Laptop tweaks"
+step "7/8 Laptop tweaks"
 if [[ $IS_LAPTOP == 1 ]]; then
   # Closing the lid normally suspends the laptop and stops mining
   LID=/etc/systemd/logind.conf.d/90-mining-laptop.conf
@@ -276,16 +316,16 @@ else
 fi
 
 # ------------------------------------------------------------------
-step "7/7 Wi-Fi + login password"
+step "8/8 Wi-Fi + login password"
 if [[ -z $WIFI_CARD ]]; then
   ok "No Wi-Fi card: use Ethernet"
-elif ip -4 -o addr show 2>/dev/null | grep -qE ': wl'; then
+elif [[ $WIFI_DONE == 1 ]] || ip -4 -o addr show 2>/dev/null | grep -qE ': wl'; then
   ok "Wi-Fi already connected"
-elif [[ $TTY == 1 ]] && yes_no "Set up Wi-Fi on this PC now? (y/N): "; then
-  if curl -fsSL "$REPO_RAW/wifi.sh" -o /tmp/wifi.sh; then
-    bash /tmp/wifi.sh
+elif [[ $TTY == 1 ]] && yes_no "Set up Wi-Fi so this PC can work without the cable? (y/N): "; then
+  if F=$(helper wifi.sh); then
+    bash "$F"
   else
-    err "Couldn't download wifi.sh from your repo."
+    err "Couldn't get wifi.sh from this drive or your repo."
   fi
 else
   ok "Wi-Fi skipped (run rig.sh again any time to set it up)"
@@ -300,6 +340,7 @@ if [[ $TTY == 1 ]]; then
     fi
   fi
 fi
+[[ $CONNECTED == 1 ]] && save_tools
 
 # ------------------------------------------------------------------
 GPU_LINE=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>/dev/null | paste -sd ';' -)
@@ -314,6 +355,7 @@ echo "Drive  : $([[ $ROOT_TRAN == usb ]] && echo "USB stick" || echo "internal (
 echo "IP     : $(hostname -I 2>/dev/null | awk '{print $1}')"
 echo "${C}-----------------------------------------------------------${N}"
 echo "Full log: $LOG"
+[[ -f /hive-config/rig.sh ]] && echo "Next time on this drive, just run:  bash /hive-config/rig.sh"
 
 if [[ $NEED_REBOOT == 1 ]]; then
   warn "Reboot needed to finish: type  sreboot"
